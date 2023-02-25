@@ -7,8 +7,6 @@ import org.springframework.batch.core.configuration.annotation.JobBuilderFactory
 import org.springframework.batch.core.configuration.annotation.JobScope;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
 import org.springframework.batch.core.launch.support.RunIdIncrementer;
-import org.springframework.batch.integration.async.AsyncItemProcessor;
-import org.springframework.batch.integration.async.AsyncItemWriter;
 import org.springframework.batch.item.ItemProcessor;
 import org.springframework.batch.item.ItemReader;
 import org.springframework.batch.item.ItemWriter;
@@ -34,13 +32,12 @@ import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.Future;
 
 @Configuration
 @Slf4j
-public class AsyncUserConfiguration {
+public class MultiThreadUserConfiguration {
 
-    private final String JOB_NAME = "asyncUserJob";
+    private final String JOB_NAME = "multiThreadUserJob";
     private final int CHUNK_SIZE = 1000;
     private final JobBuilderFactory jobBuilderFactory;
     private final StepBuilderFactory stepBuilderFactory;
@@ -50,12 +47,12 @@ public class AsyncUserConfiguration {
     private final TaskExecutor taskExecutor;
 
 
-    public AsyncUserConfiguration(JobBuilderFactory jobBuilderFactory,
-                                  StepBuilderFactory stepBuilderFactory,
-                                  UserRepostiory userRepostiory,
-                                  EntityManagerFactory entityManagerFactory,
-                                  DataSource dataSource,
-                                  TaskExecutor taskExecutor) {
+    public MultiThreadUserConfiguration(JobBuilderFactory jobBuilderFactory,
+                                        StepBuilderFactory stepBuilderFactory,
+                                        UserRepostiory userRepostiory,
+                                        EntityManagerFactory entityManagerFactory,
+                                        DataSource dataSource,
+                                        TaskExecutor taskExecutor) {
         this.jobBuilderFactory = jobBuilderFactory;
         this.stepBuilderFactory = stepBuilderFactory;
         this.userRepostiory = userRepostiory;
@@ -89,10 +86,12 @@ public class AsyncUserConfiguration {
     @Bean(JOB_NAME + "_userLevelUpStep")
     public Step userLevelUpStep() throws Exception {
         return this.stepBuilderFactory.get(JOB_NAME + "_userLevelUpStep")
-                .<User, Future<User>chunk(CHUNK_SIZE)
+                .<User, User>chunk(CHUNK_SIZE)
                 .reader(itemReader())
                 .processor(itemProcessor())
                 .writer(itemWriter())
+                .taskExecutor(this.taskExecutor) // 멀티 스레드 적용을 위한 taskExecutor 주입
+                .throttleLimit(8) // 몇개의 스레드로 chunk를 동시에 처리할지? 기본값 : 4
                 .build();
     }
 
@@ -123,8 +122,8 @@ public class AsyncUserConfiguration {
     }
 
 
-    private AsyncItemProcessor<User, User> itemProcessor() {
-        ItemProcessor<User, User> itemProcessor =  user -> {
+    private ItemProcessor<? super User, ? extends User> itemProcessor() {
+        return user -> {
 
             // 상향 대상 여부 체크
             if (user.availableLevelUp()) {
@@ -134,17 +133,11 @@ public class AsyncUserConfiguration {
             return null;
 
         };
-
-        AsyncItemProcessor<User, User> asyncItemProcessor = new AsyncItemProcessor<>();
-        asyncItemProcessor.setDelegate(itemProcessor);
-        asyncItemProcessor.setTaskExecutor(this.taskExecutor);
-
-        return asyncItemProcessor;
     }
 
 
-    private AsyncItemWriter<User> itemWriter() {
-        ItemWriter<User> itemWriter = users -> {
+    private ItemWriter<? super User> itemWriter() {
+        return users -> {
 
             users.forEach(x -> {
                 x.levelUp();
@@ -152,11 +145,6 @@ public class AsyncUserConfiguration {
             });
 
         };
-
-        AsyncItemWriter<User> asyncItemWriter = new AsyncItemWriter<>();
-        asyncItemWriter.setDelegate(itemWriter);
-
-        return asyncItemWriter;
     }
 
     private ItemReader<? extends OrderStatistics> orderStatisticsItemReader(String date) throws Exception {
