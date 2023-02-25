@@ -63,11 +63,11 @@ public class UserConfiguration {
                 .incrementer(new RunIdIncrementer())
                 .start(this.saveUserStep()) // 유저 저장 step
                 .next(this.userLevelUpStep()) // 유저 레벨업 step
-                .next(this.orderStatisticsStep(null)) // 월별 주문 금액 합계 step
+                .next(this.orderStatisticsStep(null, null)) // 월별 주문 금액 합계 step
                 .listener(new LevelUpJobExecutionListener(userRepostiory)) // JobExecutionListener
                 .next(new JobParametersDecide("date")) // date 파라미터가 있는지 검증
                     .on(JobParametersDecide.CONTINUE.getName()) // Decider가 CONTINUE를 반환하는지 (CONTINUE 상태가 아니면 실행이 안됨)
-                    .to(this.orderStatisticsStep(null)) // 해당 스텝에 대해
+                    .to(this.orderStatisticsStep(null, null)) // 해당 스텝에 대해
                     .build()
                 .build();
     }
@@ -91,11 +91,12 @@ public class UserConfiguration {
 
     @Bean(JOB_NAME + "_orderStatisticsStep")
     @JobScope
-    public Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date) throws Exception {
+    public Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date,
+                                    @Value("#{jobParameters[path]}") String path) throws Exception {
         return this.stepBuilderFactory.get(JOB_NAME + "_orderStatisticsStep")
                 .<OrderStatistics, OrderStatistics>chunk(CHUNK_SIZE)
                 .reader(orderStatisticsItemReader(date))
-                .writer(orderStatisticsItemWriter(date))
+                .writer(orderStatisticsItemWriter(date, path))
                 .build();
     }
 
@@ -173,7 +174,7 @@ public class UserConfiguration {
         return itemReader;
     }
 
-    private ItemWriter<? super OrderStatistics> orderStatisticsItemWriter(String date) throws Exception {
+    private ItemWriter<? super OrderStatistics> orderStatisticsItemWriter(String date, String path) throws Exception {
 
         YearMonth yearMonth = YearMonth.parse(date); // date의 연, 월 parse
 
@@ -187,7 +188,7 @@ public class UserConfiguration {
         lineAggregator.setFieldExtractor(fieldExtractor);
 
         FlatFileItemWriter<OrderStatistics> itemWriter = new FlatFileItemWriterBuilder<OrderStatistics>()
-                .resource(new FileSystemResource("output/" + fileName))
+                .resource(new FileSystemResource(path + fileName))
                 .lineAggregator(lineAggregator)
                 .name(JOB_NAME + "_orderStatisticsItemWriter")
                 .encoding("UTF-8")
