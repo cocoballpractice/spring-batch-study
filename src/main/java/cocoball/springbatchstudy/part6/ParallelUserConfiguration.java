@@ -6,10 +6,11 @@ import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.JobScope;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
-import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.job.builder.FlowBuilder;
+import org.springframework.batch.core.job.flow.Flow;
+import org.springframework.batch.core.job.flow.support.SimpleFlow;
 import org.springframework.batch.core.launch.support.RunIdIncrementer;
-import org.springframework.batch.core.partition.PartitionHandler;
-import org.springframework.batch.core.partition.support.TaskExecutorPartitionHandler;
+import org.springframework.batch.core.step.tasklet.TaskletStep;
 import org.springframework.batch.item.ItemProcessor;
 import org.springframework.batch.item.ItemReader;
 import org.springframework.batch.item.ItemWriter;
@@ -38,9 +39,9 @@ import java.util.Map;
 
 @Configuration
 @Slf4j
-public class PartitionUserConfiguration {
+public class ParallelUserConfiguration {
 
-    private final String JOB_NAME = "partitionUserJob";
+    private final String JOB_NAME = "parallelUserJob";
     private final int CHUNK_SIZE = 1000;
     private final JobBuilderFactory jobBuilderFactory;
     private final StepBuilderFactory stepBuilderFactory;
@@ -50,12 +51,12 @@ public class PartitionUserConfiguration {
     private final TaskExecutor taskExecutor;
 
 
-    public PartitionUserConfiguration(JobBuilderFactory jobBuilderFactory,
-                                      StepBuilderFactory stepBuilderFactory,
-                                      UserRepostiory userRepostiory,
-                                      EntityManagerFactory entityManagerFactory,
-                                      DataSource dataSource,
-                                      TaskExecutor taskExecutor) {
+    public ParallelUserConfiguration(JobBuilderFactory jobBuilderFactory,
+                                     StepBuilderFactory stepBuilderFactory,
+                                     UserRepostiory userRepostiory,
+                                     EntityManagerFactory entityManagerFactory,
+                                     DataSource dataSource,
+                                     TaskExecutor taskExecutor) {
         this.jobBuilderFactory = jobBuilderFactory;
         this.stepBuilderFactory = stepBuilderFactory;
         this.userRepostiory = userRepostiory;
@@ -68,21 +69,21 @@ public class PartitionUserConfiguration {
     public Job userJob() throws Exception {
         return this.jobBuilderFactory.get(JOB_NAME)
                 .incrementer(new RunIdIncrementer())
-                .start(this.saveUserStep()) // 유저 저장 step
-                .next(this.userLevelUpManagerStep()) // 유저 레벨업 step의 마스터 step
-                .next(this.orderStatisticsStep(null)) // 월별 주문 금액 합계 step
                 .listener(new LevelUpJobExecutionListener(userRepostiory)) // JobExecutionListener
-                .next(new JobParametersDecide("date")) // date 파라미터가 있는지 검증
-                    .on(JobParametersDecide.CONTINUE.getName()) // Decider가 CONTINUE를 반환하는지 (CONTINUE 상태가 아니면 실행이 안됨)
-                    .to(this.orderStatisticsStep(null)) // 해당 스텝에 대해
-                    .build()
+                .start(this.saveUserFlow()) // 유저 저장 flow
+                .next(this.splitFlow(null))
+                .build()
                 .build();
     }
 
-    @Bean(JOB_NAME + "_saveUserStep")
-    public Step saveUserStep() {
-        return this.stepBuilderFactory.get(JOB_NAME + "_saveUserStep")
+    @Bean(JOB_NAME + "_saveUserFlow")
+    public Flow saveUserFlow() {
+        TaskletStep saveUserStep = this.stepBuilderFactory.get(JOB_NAME + "_saveUserStep")
                 .tasklet(new SaveUserTasklet(userRepostiory)) // 유저 저장 tasklet
+                .build();
+
+        return new FlowBuilder<SimpleFlow>(JOB_NAME + "_saveUserFlow")
+                .start(saveUserStep)
                 .build();
     }
 
@@ -90,26 +91,35 @@ public class PartitionUserConfiguration {
     public Step userLevelUpStep() throws Exception {
         return this.stepBuilderFactory.get(JOB_NAME + "_userLevelUpStep")
                 .<User, User>chunk(CHUNK_SIZE)
-                .reader(itemReader(null, null))
+                .reader(itemReader())
                 .processor(itemProcessor())
                 .writer(itemWriter())
                 .build();
     }
 
-    // 마스터 스텝
-    @Bean(JOB_NAME + "_userLevelUpStep.manager")
-    public Step userLevelUpManagerStep() throws Exception {
-        return this.stepBuilderFactory.get(JOB_NAME + "_userLevelUpStep.manager")
-                .partitioner(JOB_NAME + "_userLevelUpStep", new UserLevelUpPartitioner(userRepostiory))
-                .step(userLevelUpStep()) // slave step 설정
-                .partitionHandler(taskExecutorPartitionHandler())
+    // 핵심...
+    @Bean(JOB_NAME + "_splitFlow")
+    @JobScope
+    public Flow splitFlow(@Value("#{jobParameters[date]}") String date) throws Exception {
+        Flow userLevelUpFlow = new FlowBuilder<SimpleFlow>(JOB_NAME + "_userLevelUpFlow")
+                .start(userLevelUpStep())
+                .build();
+
+        return new FlowBuilder<SimpleFlow>(JOB_NAME + "_splitFlow")
+                .split(this.taskExecutor)
+                .add(userLevelUpFlow, orderStatisticsFlow(date))
                 .build();
     }
 
+    private Flow orderStatisticsFlow(String date) throws Exception {
+        return new FlowBuilder<SimpleFlow>(JOB_NAME + "_orderStatisticsFlow")
+                .start(new JobParametersDecide("date")) // date 파라미터가 있는지 검증
+                .on(JobParametersDecide.CONTINUE.getName()) // Decider가 CONTINUE를 반환하는지 (CONTINUE 상태가 아니면 실행이 안됨)
+                .to(this.orderStatisticsStep(date)) // 해당 스텝에 대해
+                .build();
+    }
 
-    @Bean(JOB_NAME + "_orderStatisticsStep")
-    @JobScope
-    public Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date) throws Exception {
+    private Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date) throws Exception {
         return this.stepBuilderFactory.get(JOB_NAME + "_orderStatisticsStep")
                 .<OrderStatistics, OrderStatistics>chunk(CHUNK_SIZE)
                 .reader(orderStatisticsItemReader(date))
@@ -118,20 +128,10 @@ public class PartitionUserConfiguration {
     }
 
 
-    @Bean(JOB_NAME + "_userItemReader")
-    @StepScope // Thread-Safe를 위해 설정
-    // 명확하게 ItemReader 타입을 명시해야 함 (StepScope의 경우 Proxy 모드로 설정이 되므로)
-    JpaPagingItemReader<? extends User> itemReader(@Value("#{stepExecutionContext[minId]}") Long minId,
-                                          @Value("#{stepExecutionContext[maxId]}") Long maxId) throws Exception {
-
-        // 한 개의 step에서 사용할 파라미터 (@Value 어노테이션에서 받아와서 주입)
-        Map<String, Object> parameters = new HashMap<>();
-        parameters.put("minId", minId);
-        parameters.put("maxId", maxId);
+    private ItemReader<? extends User> itemReader() throws Exception {
 
         JpaPagingItemReader itemReader = new JpaPagingItemReaderBuilder<User>()
-                .queryString("select u from User u where u.id between :minId and :maxId")
-                .parameterValues(parameters)
+                .queryString("select u from User u")
                 .entityManagerFactory(entityManagerFactory)
                 .pageSize(CHUNK_SIZE) // 보통 chunk 사이즈와 동일하게
                 .name(JOB_NAME + "_userItemReader")
@@ -208,7 +208,7 @@ public class PartitionUserConfiguration {
         String fileName = yearMonth.getYear() + "년_" + yearMonth.getMonthValue() + "월_일별_주문_금액.csv";
 
         BeanWrapperFieldExtractor<OrderStatistics> fieldExtractor = new BeanWrapperFieldExtractor<>();
-        fieldExtractor.setNames(new String[] {"amount", "date"});
+        fieldExtractor.setNames(new String[]{"amount", "date"});
 
         DelimitedLineAggregator<OrderStatistics> lineAggregator = new DelimitedLineAggregator<>();
         lineAggregator.setDelimiter(",");
@@ -226,17 +226,6 @@ public class PartitionUserConfiguration {
 
         return itemWriter;
 
-    }
-
-    @Bean(JOB_NAME + "_taskExecutorPartitionHandler")
-    PartitionHandler taskExecutorPartitionHandler() throws Exception {
-        TaskExecutorPartitionHandler handler = new TaskExecutorPartitionHandler();
-
-        handler.setStep(userLevelUpStep());
-        handler.setTaskExecutor(this.taskExecutor);
-        handler.setGridSize(8); // partitioner에서 지정한 gridSize
-
-        return handler;
     }
 
 
